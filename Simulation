@@ -1,0 +1,488 @@
+# ═══════════════════════════════════════════════════════════════
+#  Two-Stage Dictator / Ultimatum Game Simulation
+#  with Justice Sensitivity and Inequity Aversion
+# ═══════════════════════════════════════════════════════════════
+ 
+# %%
+# ───────────────────────────────────────────────────────────────
+#  CELL 1 — PARAMETERS
+#  Nothing is calculated here. Only values are declared.
+# ───────────────────────────────────────────────────────────────
+ 
+import numpy as np
+import pandas as pd
+ 
+# ── Number of participants ───────────────────────────────────────
+# Must be even (participants are paired in both rounds)
+N = 500
+ 
+# ── Round 1 data file ────────────────────────────────────────────
+# Excel file must be in the same directory as this script.
+# Column used: sharing
+DATA_FILE   = "round1_data2.xlsx"
+DATA_COLUMN = "sharing"
+ 
+# ── Second-round endowment ───────────────────────────────────────
+ENDOWMENT = 100
+ 
+# ── Fehr-Schmidt inequity aversion parameter ranges ──────────────
+# α > β  (disadvantageous aversion > advantageous aversion)
+# i.e. envy stronger than guilt — standard Fehr-Schmidt formulation.
+# People feel worse about receiving less than others than about
+# receiving more than others.
+#
+# Draw order in Cell 2:
+#   1. α  drawn from [ALPHA_MIN, ALPHA_MAX]
+#   2. β  drawn from [BETA_MIN,  α − ALPHA_OFFSET]
+# Ranges: Nunnari & Pozzi (2022), Eckel & Gintis (2010)
+ALPHA_MIN    = 0.15
+ALPHA_MAX    = 0.85 
+ALPHA_OFFSET = 0.05   # guaranteed minimum gap: α ≥ β + ALPHA_OFFSET
+BETA_MIN     = 0.10
+ 
+# ── Past-experience dampening ────────────────────────────────────
+# λ ∈ [0,1] controls how strongly round-1 experience feeds into
+# round-2 decisions. λ=0 means past experience has no effect,
+# λ=1 means full weight. Theoretically: reciprocity is one of
+# several motives, not the dominant one.
+LAMBDA = 1.0
+ 
+# ── CRRA exponent range — material term ─────────────────────────
+# r drawn per participant from uniform [R_MIN, R_MAX]
+# Source: Holt & Laury (2002), Andreoni & Miller (2002)
+R_MIN = 0.4
+R_MAX = 0.8
+
+# ── CRRA exponent range — altruism term ─────────────────────────
+# r_alt drawn independently per participant from [R_ALT_MIN, R_ALT_MAX]
+# Governs only the altruism component of utility, separately from
+# the material CRRA exponent above.
+R_ALT_MIN = 0.05
+R_ALT_MAX = 0.10
+ 
+# ── Justice Sensitivity distributions  (JSS-8, Likert scale 1–6) ─
+# Source: Groskurth et al. (2023), UK quota sample
+# Order: [Victim, Observer, Beneficiary, Perpetrator]
+JS_MEANS = np.array([3.9, 4.5, 4.0, 4.8])
+JS_SDS   = np.array([1.3, 1.1, 1.2, 1.0])
+
+# Inter-subscale correlation matrix (Groskurth et al. 2023, Fig. 1)
+JS_CORR = np.array([
+    [1.00, 0.47, 0.23, 0.13],   # Victim
+    [0.47, 1.00, 0.55, 0.37],   # Observer
+    [0.23, 0.55, 1.00, 0.60],   # Beneficiary
+    [0.13, 0.37, 0.60, 1.00],   # Perpetrator
+])
+
+# ── Demographic controls ─────────────────────────────────────────
+
+# Gender: assigned randomly in Cell 2 (0 = male, 1 = female)
+# Gender bonus: tokens added to stage-2 offer for female dictators.
+# Source: Barreda-Tarrazona et al. (2025), N=1,161 lab subjects —
+# women transfer 7.5 percentage points (~40%) more than men on average
+# after controlling for age, cognitive ability, personality and emotions.
+# On a 100-token endowment this maps directly to +7.5 tokens.
+# Confirmed by meta-analyses: Doñate-Buendía et al. (2022), 136 DG
+# conditions; Engel (2011) meta-study, 20,813 dictators.
+PROP_FEMALE  = 0.5    # proportion female; 0.5 = balanced sample
+FEMALE_BONUS = 7.5    # tokens added for female dictators
+
+# Age: calculated from year-of-birth column in round-1 data file.
+# Age bonus: tokens added per year of age.
+# Source: Engel (2011) meta-study — age has a "strong effect";
+# giving nothing decreases with age and never occurs in the elderly.
+# Ogawa et al. (2020), N=514 non-student adults — older dictators
+# (≥40 years) give significantly more than younger ones (20–29 years).
+# Barreda-Tarrazona et al. (2025) — altruism increases with age,
+# significant for male dictators. Rate of +0.4 tokens per year is a
+# conservative estimate consistent with the gradient in the literature.
+CURRENT_YEAR   = 2026   # used to compute age from year of birth
+AGE_BONUS_RATE = 0.4    # tokens per year of age
+
+# ── White noise ──────────────────────────────────────────────────
+# Gaussian noise added to stage2_offer_final to simulate
+# unmodelled sources of behavioural variation in real experiments.
+# ε ~ N(0, NOISE_SD²), applied after demographic adjustments,
+# then re-clipped to [0, SHARE_CAP].
+# Source for calibration: Engel (2011) meta-study reports residual SD
+# of 15–20 tokens across DG experiments; OLS Root MSE in our baseline
+# regressions ranges from 12 to 21 tokens.
+NOISE_SD = 10   
+ 
+ 
+# %%
+# ───────────────────────────────────────────────────────────────
+#  CELL 2 — ROUND 1 SIMULATION
+#  Assigns individual preferences and round-1 experiences.
+#  Output: DataFrame `participants` with N rows.
+# ───────────────────────────────────────────────────────────────
+ 
+rng = np.random.default_rng(seed=42)
+ 
+# ── Step 1: Load and convert round-1 offer distribution ─────────
+# Reads sharing, endownment, and year-of-birth (column "age") from file.
+# Offer normalised to [0,100] using actual endowment per row:
+#     offer = round( sharing / endownment * 100 )
+raw          = pd.read_excel(DATA_FILE, usecols=["sharing", "endownment", "age"])
+raw          = raw.dropna()
+offer_sample = (raw["sharing"] / raw["endownment"] * 100).round(0).astype(int).values
+
+# Year of birth → age at time of experiment
+birth_years  = raw["age"].astype(int).values
+age_sample   = CURRENT_YEAR - birth_years   # age in years
+
+offer_values, offer_counts = np.unique(offer_sample, return_counts=True)
+offer_probs  = offer_counts / offer_counts.sum()
+
+# ── Step 2: Draw individual preferences ─────────────────────────
+
+# α drawn first, β drawn from [BETA_MIN, α − ALPHA_OFFSET]
+# guarantees α > β on every draw with no rejection waste.
+alphas = rng.uniform(ALPHA_MIN, ALPHA_MAX, size=N)
+betas  = np.array([rng.uniform(BETA_MIN, a - ALPHA_OFFSET) for a in alphas])
+
+# CRRA exponent r — material term
+r_values     = rng.uniform(R_MIN,     R_MAX,     size=N)
+
+# CRRA exponent r_alt — altruism term (drawn independently)
+r_alt_values = rng.uniform(R_ALT_MIN, R_ALT_MAX, size=N)
+
+# Gender: randomly assigned, 0 = male, 1 = female
+# PROP_FEMALE controls the share of female participants
+genders = rng.choice([0, 1], size=N, p=[1 - PROP_FEMALE, PROP_FEMALE])
+
+# Justice sensitivity: multivariate normal → clipped to [1,6] → stored as [0,1]
+JS_COV     = np.outer(JS_SDS, JS_SDS) * JS_CORR
+js_raw     = rng.multivariate_normal(JS_MEANS, JS_COV, size=N)
+js_clipped = np.clip(js_raw, 1.0, 6.0)
+js_normed  = (js_clipped - 1.0) / 5.0   # maps [1,6] → [0,1]
+
+# ── Step 3: Pair participants and assign round-1 experiences ─────
+# Pairs: (1,2), (3,4), ...  Odd index → Dictator, Even → Receiver
+# Both members share the same offer X and age drawn from the empirical dist.
+# Age is sampled jointly with the offer to preserve any correlation
+# between age and generosity present in the source data.
+
+n_pairs      = N // 2
+# Sample row indices uniformly — each row is equally likely, which
+# naturally preserves the empirical offer and age distribution since
+# frequent offer values appear in more rows.
+pair_indices = rng.choice(len(offer_sample), size=n_pairs, replace=True)
+
+roles, offers, ages = [], [], []
+for idx in pair_indices:
+    x = offer_sample[idx]
+    a = age_sample[idx]
+    roles.append("Dictator");  offers.append(x);  ages.append(a)
+    roles.append("Receiver");  offers.append(x);  ages.append(a)
+ 
+# ── Step 4: Assemble participant DataFrame ───────────────────────
+participants = pd.DataFrame({
+    "participant_id" : np.arange(1, N + 1),
+    "stage1_role"    : roles,
+    "stage1_offer"   : offers,
+    "age"            : ages,
+    "gender"         : genders,   # 0 = male, 1 = female
+    "alpha"          : alphas,
+    "beta"           : betas,
+    "r_crra"         : r_values,
+    "r_alt_crra"     : r_alt_values,
+    "js_victim"      : js_normed[:, 0],
+    "js_observer"    : js_normed[:, 1],
+    "js_beneficiary" : js_normed[:, 2],
+    "js_perpetrator" : js_normed[:, 3],
+})
+ 
+participants.to_excel("created_data.xlsx", index=False)
+ 
+print("=== Round 1 Summary ===")
+print(f"Participants : {len(participants)}")
+print(f"Dictators    : {(participants.stage1_role == 'Dictator').sum()}")
+print(f"Receivers    : {(participants.stage1_role == 'Receiver').sum()}")
+print(f"Offer range  : {participants.stage1_offer.min()} – {participants.stage1_offer.max()}")
+print(f"α > β check  : {(participants.alpha > participants.beta).all()}")
+print(participants.head(6).to_string(index=False))
+ 
+ 
+# %%
+# ───────────────────────────────────────────────────────────────
+#  CELL 3 — SECOND ROUND SETUP
+#  Random re-pairing, role assignment, interaction types,
+#  dummies, and continuous κ.
+# ───────────────────────────────────────────────────────────────
+ 
+# ── Step 1: Random re-pairing ────────────────────────────────────
+shuffled_ids = rng.permutation(participants["participant_id"].values)
+partner_map  = {}
+for i in range(0, N, 2):
+    id_a = shuffled_ids[i];   id_b = shuffled_ids[i + 1]
+    partner_map[id_a] = id_b; partner_map[id_b] = id_a
+ 
+participants["partner_id"] = participants["participant_id"].map(partner_map)
+ 
+# ── Step 2: Assign second-round roles ───────────────────────────
+stage2_roles = {}
+processed    = set()
+for pid in participants["participant_id"]:
+    if pid in processed:
+        continue
+    partner = partner_map[pid]
+    if rng.integers(0, 2) == 0:
+        stage2_roles[pid] = "Dictator"; stage2_roles[partner] = "Receiver"
+    else:
+        stage2_roles[pid] = "Receiver"; stage2_roles[partner] = "Dictator"
+    processed.update([pid, partner])
+ 
+participants["stage2_role"] = participants["participant_id"].map(stage2_roles)
+ 
+# ── Step 3: Interaction type ─────────────────────────────────────
+partner_stage1 = participants.set_index("participant_id")["stage1_role"].to_dict()
+participants["partner_stage1_role"] = participants["partner_id"].map(partner_stage1)
+ 
+def role_initial(role):
+    return "D" if role == "Dictator" else "R"
+ 
+participants["interaction_type"] = (
+    participants["stage1_role"].map(role_initial) +
+    participants["partner_stage1_role"].map(role_initial)
+)
+ 
+# ── Step 4: Interaction-type dummies ────────────────────────────
+for itype in ["DD", "DR", "RD", "RR"]:
+    participants[f"is_{itype}"] = (participants["interaction_type"] == itype).astype(int)
+ 
+# ── Step 5: Continuous κ ─────────────────────────────────────────
+# κ = (stage1_offer - 50) / 50  →  range [-1, +1]
+# Encodes degree of generosity in round 1:
+#   offer=0   → κ=-1.0  (maximally stingy)
+#   offer=50  → κ= 0.0  (equal split, neutral)
+#   offer=100 → κ=+1.0  (maximally generous)
+participants["kappa"] = (participants["stage1_offer"] - 50) / 50
+ 
+participants.to_excel("created_data.xlsx", index=False)
+participants.to_excel("Excel2.xlsx",        index=False)
+ 
+print("=== Round 2 Setup ===")
+print(f"Stage-2 Dictators : {(participants.stage2_role == 'Dictator').sum()}")
+print(f"Stage-2 Receivers : {(participants.stage2_role == 'Receiver').sum()}")
+print("\nInteraction type counts:")
+print(participants["interaction_type"].value_counts().to_string())
+print("\nκ distribution:")
+print(participants["kappa"].describe().round(3).to_string())
+print(participants[["participant_id","stage1_role","stage2_role",
+                     "interaction_type","is_DD","is_DR","is_RD","is_RR",
+                     "kappa"]].head(8).to_string(index=False))
+ 
+ 
+# %%
+# ───────────────────────────────────────────────────────────────
+#  CELL 4 — SECOND ROUND OPTIMIZATION
+#  Finds X* ∈ [0, 1000] that maximises each Dictator's utility.
+#  Receivers get NaN.
+# ───────────────────────────────────────────────────────────────
+ 
+# ── Step 1: Map interaction type to active JS facet ──────────────
+# Per Table 1 (thesis):
+#   DD → Observer,    DR → Perpetrator,
+#   RR → Perpetrator, RD → Victim
+#
+# ρ_ij = individual JS score / subscale population mean
+#   → centered at 1.0 for average-sensitivity person
+#   → <1 for low JS, >1 for high JS
+#
+# Population means on [0,1] scale: (JS_MEANS - 1) / 5
+JS_MEANS_NORMED = (JS_MEANS - 1) / 5   # [0.58, 0.70, 0.60, 0.76]
+
+FACET_MAP = {
+    "DD": ("js_observer",    JS_MEANS_NORMED[1]),
+    "DR": ("js_perpetrator", JS_MEANS_NORMED[3]),
+    "RR": ("js_perpetrator", JS_MEANS_NORMED[3]),
+    "RD": ("js_victim",      JS_MEANS_NORMED[0]),
+}
+
+# ── Step 2: Compute rho_ij — direction-aware JS weight ───────────
+# Positive experience (kappa > 0):
+#   rho = js_score / js_mean   → higher JS = stronger altruism
+#
+# Negative experience (kappa <= 0):
+#   rho = (1 - js_score) / (1 - js_mean)
+#   → higher JS = lower rho (moral concern dampens giving less)
+#   → lower JS  = higher rho (less constrained by fairness norms)
+#
+# RR cell with kappa <= 0 is neutral: rho set to 0.
+
+def get_rho(row):
+    itype    = row["interaction_type"]
+    kappa    = row["kappa"]
+    js_col, js_mean = FACET_MAP[itype]
+    js_score = row[js_col]          # already normalised to [0,1]
+
+    if kappa > 0:
+        # standard normalisation: centered at 1.0
+        return js_score / js_mean
+    elif itype == "RR":
+        # neutral: no altruism modifier
+        return 0.0
+    else:
+        # reverse normalisation: high JS → low rho
+        js_mean_rev = 1.0 - js_mean
+        js_rev      = 1.0 - js_score
+        return js_rev / js_mean_rev if js_mean_rev > 0 else 0.0
+
+participants["rho_ij"] = participants.apply(get_rho, axis=1)
+
+# ── Step 3: Define utility function ─────────────────────────────
+
+# rho_ij is direction-aware based on kappa sign:
+#   kappa > 0  → standard JS normalisation (higher JS = more giving)
+#   kappa <= 0 → reversed JS normalisation (higher JS = less giving,
+#                moral concern results in generosity reduction)
+#   RR + kappa <= 0 → rho = 0, no altruism modifier
+# Inequity term is a stable personality trait, always active.
+
+E = ENDOWMENT
+
+def utility(X, E, r, r_alt, alpha, beta, rho):
+    material    = ((E - X) / E) ** r
+    altruism    = rho * (X / E) ** r_alt
+    adv_ineq    = max(2 * X / E - 1, 0)
+    disadv_ineq = max(1 - 2 * X / E, 0)
+    inequality  = (-alpha * adv_ineq - beta * disadv_ineq)
+    return material + altruism + inequality
+ 
+# ── Step 3: Optimise X for every Stage-2 Dictator ───────────────
+X_grid    = np.arange(0, E + 1)
+optimal_X = []
+optimal_u = []
+ 
+for _, row in participants.iterrows():
+    if row["stage2_role"] != "Dictator":
+        optimal_X.append(np.nan)
+        optimal_u.append(np.nan)
+        continue
+ 
+    utilities = [
+        utility(
+            X     = x,
+            E     = E,
+            r     = row["r_crra"],
+            r_alt = row["r_alt_crra"],
+            alpha = row["alpha"],
+            beta  = row["beta"],
+            rho   = row["rho_ij"],
+        )
+        for x in X_grid
+    ]
+ 
+    best_X = X_grid[np.argmax(utilities)]
+    optimal_X.append(int(best_X))
+    optimal_u.append(max(utilities))
+ 
+participants["stage2_offer"]   = optimal_X
+participants["stage2_utility"] = optimal_u
+
+# ── Step 5: Apply sharing cap ────────────────────────────────────
+SHARE_CAP = 50
+
+participants["stage2_offer_model"]  = participants["stage2_offer"]
+participants["stage2_offer_capped"] = participants["stage2_offer"].apply(
+    lambda x: min(x, SHARE_CAP) if not pd.isna(x) else np.nan
+)
+
+# ── Step 6: Apply demographic adjustments ────────────────────────
+# Applied after utility optimisation as additive shifters on the
+# capped offer, then re-capped to [0, SHARE_CAP].
+#
+# Gender effect:
+#   Source: Barreda-Tarrazona et al. (2025) — females transfer
+#   7.5 percentage points more than males on a 100-token endowment.
+#
+# Age effect:
+#   Source: Engel (2011), Ogawa et al. (2020) — older participants
+#   give significantly more; rate of +0.4 tokens per year of age.
+#   Age is centred at the sample mean so that the average participant
+#   receives zero age adjustment, preserving the model's baseline.
+
+age_mean = participants["age"].mean()
+
+def apply_demographics(row):
+    if pd.isna(row["stage2_offer_capped"]):
+        return np.nan
+    gender_adj = FEMALE_BONUS * row["gender"]
+    age_adj    = AGE_BONUS_RATE * (row["age"] - age_mean)
+    adjusted   = row["stage2_offer_capped"] + gender_adj + age_adj
+    return float(np.clip(adjusted, 0, SHARE_CAP))
+
+participants["stage2_offer_final"] = participants.apply(apply_demographics, axis=1)
+
+# ── Step 7: Apply white noise ─────────────────────────────────────
+# ε ~ N(0, NOISE_SD²) added to the final offer, then re-clipped to
+# [0, SHARE_CAP]. Receivers remain NaN.
+# NOISE_SD is declared in Cell 1. Set to 0 to disable.
+
+if NOISE_SD > 0:
+    noise = rng.normal(loc=0.0, scale=NOISE_SD, size=N)
+    def apply_noise(row, eps):
+        if pd.isna(row["stage2_offer_final"]):
+            return np.nan
+        return float(np.clip(row["stage2_offer_final"] + eps, 0, SHARE_CAP))
+
+    participants["stage2_offer_noisy"] = [
+        apply_noise(row, noise[i])
+        for i, (_, row) in enumerate(participants.iterrows())
+    ]
+else:
+    # No noise — noisy column equals final column
+    participants["stage2_offer_noisy"] = participants["stage2_offer_final"]
+
+# ── Step 8: Save ─────────────────────────────────────────────────
+participants.to_excel("end_simulation.xlsx", index=False)
+
+# ── Summary ──────────────────────────────────────────────────────
+dictators = participants[participants["stage2_role"] == "Dictator"]
+
+print("=== Second Round Optimization ===")
+print(f"Endowment           : {E} tokens")
+print(f"Sharing cap         : {SHARE_CAP} tokens")
+print(f"Noise SD            : {NOISE_SD} tokens")
+print(f"Dictators optimised : {dictators.shape[0]}")
+print(f"Receivers (NaN)     : {participants['stage2_offer'].isna().sum()}")
+print(f"Offers capped       : {(dictators['stage2_offer_model'] > SHARE_CAP).sum()}")
+print(f"Sample mean age     : {age_mean:.1f} years")
+print(f"Female share        : {participants['gender'].mean():.2f}")
+print()
+print("Stage-2 offer distribution — final (Dictators only):")
+print(dictators["stage2_offer_final"].describe().round(2).to_string())
+print()
+print("Stage-2 offer distribution — noisy (Dictators only):")
+print(dictators["stage2_offer_noisy"].describe().round(2).to_string())
+print()
+print("Mean noisy offer by interaction type:")
+print(dictators.groupby("interaction_type")["stage2_offer_noisy"].mean().round(2).to_string())
+print()
+print(participants[["participant_id","stage1_role","stage2_role",
+                     "interaction_type","kappa","rho_ij",
+                     "alpha","beta","r_crra","age","gender",
+                     "stage2_offer_model",
+                     "stage2_offer_final",
+                     "stage2_offer_noisy"]].head(10).to_string(index=False))
+ 
+# ── Chart: Stage-2 offer distribution (capped) ───────────────────
+import matplotlib.pyplot as plt
+ 
+offers_final = dictators["stage2_offer_noisy"].dropna()
+
+fig, ax = plt.subplots(figsize=(7, 5))
+ax.hist(
+    offers_final,
+    bins      = range(0, SHARE_CAP + 1, 10),
+    edgecolor = "white",
+    color     = "steelblue",
+    rwidth    = 0.85,
+)
+ax.set_xlabel("Stage-2 Offer (tokens)", fontsize=11)
+ax.set_ylabel("Number of Dictators",    fontsize=11)
+ax.set_title(f"Distribution of Stage-2 Offers (noise SD = {NOISE_SD})", fontsize=13)
+ax.set_xticks(range(0, SHARE_CAP + 1, 10))
+plt.tight_layout()
+plt.show()
