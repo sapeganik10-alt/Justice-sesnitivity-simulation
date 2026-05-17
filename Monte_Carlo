@@ -1,0 +1,424 @@
+# ═══════════════════════════════════════════════════════════════
+#  monte_carlo.py
+#  Monte Carlo wrapper around the two-stage game simulation.
+#  Runs N_MC replications, collects OLS + Tobit estimates from
+#  each, and reports averaged coefficients, cross-run std devs,
+#  and rejection rates at the 5% level.
+#
+#  Requirements:
+#    pip install numpy pandas scipy statsmodels openpyxl tqdm
+#
+#  Place this file in the same folder as:
+#    eleven.py            (your original simulation script)
+#    round1_data2.xlsx    (empirical round-1 offer data)
+# ═══════════════════════════════════════════════════════════════
+ 
+import numpy as np
+import pandas as pd
+from scipy import stats, optimize
+import statsmodels.api as sm
+import warnings
+warnings.filterwarnings("ignore")
+ 
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(x, **kwargs): return x   # silent fallback
+ 
+ 
+# ───────────────────────────────────────────────────────────────
+#  0.  PARAMETERS  (copied from eleven.py — do not edit here,
+#      edit eleven.py and they will stay in sync via import)
+# ───────────────────────────────────────────────────────────────
+ 
+# We import the constants directly so there is a single source of truth.
+# eleven.py uses `rng = ...` at module level — that RNG is created once on
+# import, which is fine; simulate() creates its own local RNG each call.
+import eleven as _src
+ 
+N            = _src.N
+DATA_FILE    = _src.DATA_FILE
+ENDOWMENT    = _src.ENDOWMENT
+SHARE_CAP    = _src.SHARE_CAP
+ALPHA_MIN    = _src.ALPHA_MIN
+ALPHA_MAX    = _src.ALPHA_MAX
+ALPHA_OFFSET = _src.ALPHA_OFFSET
+BETA_MIN     = _src.BETA_MIN
+R_MIN        = _src.R_MIN
+R_MAX        = _src.R_MAX
+R_ALT_MIN    = _src.R_ALT_MIN
+R_ALT_MAX    = _src.R_ALT_MAX
+JS_MEANS     = _src.JS_MEANS
+JS_SDS       = _src.JS_SDS
+JS_CORR      = _src.JS_CORR
+PROP_FEMALE  = _src.PROP_FEMALE
+FEMALE_BONUS = _src.FEMALE_BONUS
+CURRENT_YEAR = _src.CURRENT_YEAR
+AGE_BONUS_RATE = _src.AGE_BONUS_RATE
+ 
+JS_MEANS_NORMED = (JS_MEANS - 1) / 5
+FACET_MAP = {
+    "DD": ("js_observer",    JS_MEANS_NORMED[1]),
+    "DR": ("js_perpetrator", JS_MEANS_NORMED[3]),
+    "RR": ("js_perpetrator", JS_MEANS_NORMED[3]),
+    "RD": ("js_victim",      JS_MEANS_NORMED[0]),
+}
+JS_COL = {"DD": "js_observer", "DR": "js_perpetrator",
+           "RR": "js_perpetrator", "RD": "js_victim"}
+ 
+N_MC    = 500   # number of Monte Carlo replications
+MIN_OBS = 8     # minimum cell size to attempt a regression
+ 
+ 
+# ───────────────────────────────────────────────────────────────
+#  1.  LOAD ROUND-1 DATA ONCE  (shared across all replications)
+# ───────────────────────────────────────────────────────────────
+ 
+_raw         = pd.read_excel(DATA_FILE, usecols=["sharing", "endownment", "age"])
+_raw         = _raw.dropna()
+offer_sample = (_raw["sharing"] / _raw["endownment"] * 100).round(0).astype(int).values
+age_sample   = CURRENT_YEAR - _raw["age"].astype(int).values
+ 
+ 
+# ───────────────────────────────────────────────────────────────
+#  2.  SIMULATE FUNCTION
+#  Self-contained: takes a seed, returns the full participants
+#  DataFrame exactly as eleven.py would produce it.
+# ───────────────────────────────────────────────────────────────
+ 
+def simulate(seed: int) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+ 
+    # preferences
+    alphas       = rng.uniform(ALPHA_MIN, ALPHA_MAX, size=N)
+    betas        = np.array([rng.uniform(BETA_MIN, a - ALPHA_OFFSET) for a in alphas])
+    r_values     = rng.uniform(R_MIN,     R_MAX,     size=N)
+    r_alt_values = rng.uniform(R_ALT_MIN, R_ALT_MAX, size=N)
+    genders      = rng.choice([0, 1], size=N, p=[1 - PROP_FEMALE, PROP_FEMALE])
+ 
+    JS_COV     = np.outer(JS_SDS, JS_SDS) * JS_CORR
+    js_raw     = rng.multivariate_normal(JS_MEANS, JS_COV, size=N)
+    js_normed  = (np.clip(js_raw, 1.0, 6.0) - 1.0) / 5.0
+ 
+    # round-1 pairing
+    pair_idx = rng.choice(len(offer_sample), size=N // 2, replace=True)
+    roles, offers, ages = [], [], []
+    for idx in pair_idx:
+        roles  += ["Dictator", "Receiver"]
+        offers += [offer_sample[idx]] * 2
+        ages   += [age_sample[idx]]   * 2
+ 
+    df = pd.DataFrame({
+        "participant_id" : np.arange(1, N + 1),
+        "stage1_role"    : roles,
+        "stage1_offer"   : offers,
+        "age"            : ages,
+        "gender"         : genders,
+        "alpha"          : alphas,
+        "beta"           : betas,
+        "r_crra"         : r_values,
+        "r_alt_crra"     : r_alt_values,
+        "js_victim"      : js_normed[:, 0],
+        "js_observer"    : js_normed[:, 1],
+        "js_beneficiary" : js_normed[:, 2],
+        "js_perpetrator" : js_normed[:, 3],
+    })
+ 
+    # round-2 re-pairing
+    shuffled = rng.permutation(df["participant_id"].values)
+    pmap = {}
+    for i in range(0, N, 2):
+        a, b = shuffled[i], shuffled[i + 1]
+        pmap[a] = b;  pmap[b] = a
+    df["partner_id"] = df["participant_id"].map(pmap)
+ 
+    s2roles = {};  done = set()
+    for pid in df["participant_id"]:
+        if pid in done: continue
+        partner = pmap[pid]
+        if rng.integers(0, 2) == 0:
+            s2roles[pid] = "Dictator"; s2roles[partner] = "Receiver"
+        else:
+            s2roles[pid] = "Receiver"; s2roles[partner] = "Dictator"
+        done.update([pid, partner])
+    df["stage2_role"] = df["participant_id"].map(s2roles)
+ 
+    # interaction type & kappa
+    ps1 = df.set_index("participant_id")["stage1_role"].to_dict()
+    df["partner_stage1_role"] = df["partner_id"].map(ps1)
+    ri = lambda r: "D" if r == "Dictator" else "R"
+    df["interaction_type"] = df["stage1_role"].map(ri) + df["partner_stage1_role"].map(ri)
+    df["kappa"] = (df["stage1_offer"] - 50) / 50
+ 
+    # rho_ij
+    def get_rho(row):
+        js_col, js_mean = FACET_MAP[row["interaction_type"]]
+        js_score = row[js_col]
+        if row["kappa"] > 0:
+            return js_score / js_mean
+        elif row["interaction_type"] == "RR":
+            return 0.0
+        else:
+            denom = 1.0 - js_mean
+            return (1.0 - js_score) / denom if denom > 0 else 0.0
+    df["rho_ij"] = df.apply(get_rho, axis=1)
+ 
+    # utility optimisation
+    E      = ENDOWMENT
+    X_grid = np.arange(0, E + 1)
+ 
+    def utility(X, r, r_alt, alpha, beta, rho):
+        return (((E - X) / E) ** r
+                + rho * (X / E) ** r_alt
+                - alpha * max(2 * X / E - 1, 0)
+                - beta  * max(1 - 2 * X / E, 0))
+ 
+    opt_X = []
+    for _, row in df.iterrows():
+        if row["stage2_role"] != "Dictator":
+            opt_X.append(np.nan); continue
+        u = [utility(x, row["r_crra"], row["r_alt_crra"],
+                     row["alpha"], row["beta"], row["rho_ij"]) for x in X_grid]
+        opt_X.append(int(X_grid[np.argmax(u)]))
+ 
+    df["stage2_offer_capped"] = pd.Series(opt_X, dtype="Float64").clip(upper=SHARE_CAP).values
+ 
+    # demographic adjustments
+    age_mean = df["age"].mean()
+    def apply_demo(row):
+        if pd.isna(row["stage2_offer_capped"]): return np.nan
+        adj = (row["stage2_offer_capped"]
+               + FEMALE_BONUS    * row["gender"]
+               + AGE_BONUS_RATE  * (row["age"] - age_mean))
+        return float(np.clip(adj, 0, SHARE_CAP))
+    df["stage2_offer_final"] = df.apply(apply_demo, axis=1)
+ 
+    return df
+ 
+ 
+# ───────────────────────────────────────────────────────────────
+#  3.  TOBIT LOG-LIKELIHOOD & FITTER
+#  Left-censored at ll, right-censored at ul.
+#  Parameterised with log(σ) so optimisation is unconstrained.
+# ───────────────────────────────────────────────────────────────
+ 
+def _tobit_nll(params, y, X, ll, ul):
+    """Negative log-likelihood for the Tobit model."""
+    beta  = params[:-1]
+    sigma = np.exp(params[-1])          # always positive
+    mu    = X @ beta
+    nll   = 0.0
+ 
+    mask_lo  = y <= ll
+    mask_hi  = y >= ul
+    mask_mid = ~mask_lo & ~mask_hi
+ 
+    if mask_lo.any():
+        nll -= stats.norm.logcdf((ll - mu[mask_lo]) / sigma).sum()
+    if mask_hi.any():
+        nll -= stats.norm.logsf((ul - mu[mask_hi]) / sigma).sum()
+    if mask_mid.any():
+        nll -= stats.norm.logpdf(y[mask_mid], mu[mask_mid], sigma).sum()
+    return nll
+ 
+ 
+def tobit_fit(y: np.ndarray, X: np.ndarray, ll: float = 0, ul: float = 50):
+    """
+    Fit a Tobit model by MLE.
+    Returns an object with .params, .bse (standard errors), and .pvalues.
+    The last element of the raw parameter vector is log-sigma and is dropped
+    before returning, so .params aligns with the columns of X.
+    """
+    # starting values: OLS coefficients + log(residual std)
+    ols0   = np.linalg.lstsq(X, y, rcond=None)[0]
+    resid0 = y - X @ ols0
+    s0     = np.log(max(resid0.std(), 1e-3))
+    p0     = np.append(ols0, s0)
+ 
+    res = optimize.minimize(
+        _tobit_nll, p0, args=(y, X, ll, ul),
+        method="L-BFGS-B",
+        options={"maxiter": 2000, "ftol": 1e-12, "gtol": 1e-8},
+    )
+ 
+    # numerical Hessian → standard errors
+    try:
+        hess_inv = res.hess_inv.todense() if hasattr(res.hess_inv, "todense") \
+                   else np.array(res.hess_inv)
+        se = np.sqrt(np.abs(np.diag(hess_inv)))
+    except Exception:
+        se = np.full(len(res.x), np.nan)
+ 
+    # wrap in a simple namespace so callers use .params / .bse / .pvalues
+    coef    = res.x[:-1]           # drop log-sigma
+    se_coef = se[:-1]
+    tstat   = np.where(se_coef > 0, coef / se_coef, np.nan)
+    pvals   = 2 * stats.norm.sf(np.abs(tstat))
+ 
+    class _Result:
+        params  = coef
+        bse     = se_coef
+        pvalues = pvals
+        converged = res.success
+ 
+    return _Result()
+ 
+ 
+# ───────────────────────────────────────────────────────────────
+#  4.  REGRESSION RUNNER  (mirrors Table 4 structure exactly)
+#  Returns a dict of {cell: {ols: result, tobit: result}}
+#  for one simulated dataset.
+# ───────────────────────────────────────────────────────────────
+ 
+CELLS    = ["DD", "DR", "RD", "RR"]
+REG_COLS = ["const", "age", "gender", "js_score"]   # column order in X matrix
+ 
+def run_regressions(df: pd.DataFrame) -> dict:
+    """
+    Run OLS and Tobit for each cell on the negative-kappa subsample.
+    Returns nested dict keyed by cell → method → namedresult.
+    Missing cells (too few obs) are stored as None.
+    """
+    dictators = df[
+        (df["stage2_role"] == "Dictator") & (df["kappa"] < 0)
+    ].copy()
+ 
+    results = {}
+ 
+    for cell in CELLS:
+        cell_df = dictators[dictators["interaction_type"] == cell].copy()
+        results[cell] = {"ols": None, "tobit": None}
+ 
+        if len(cell_df) < MIN_OBS:
+            continue
+ 
+        cell_df["js_score"] = cell_df[JS_COL[cell]]
+        cell_df["const"]    = 1.0
+ 
+        X = cell_df[REG_COLS].values.astype(float)
+        y = cell_df["stage2_offer_final"].values.astype(float)
+ 
+        # OLS with HC3 robust standard errors (matches your eleven.py output)
+        try:
+            ols_res = sm.OLS(y, X).fit(cov_type="HC3")
+            results[cell]["ols"] = ols_res
+        except Exception:
+            pass
+ 
+        # Tobit censored at [0, 50]
+        try:
+            tobit_res = tobit_fit(y, X, ll=0.0, ul=float(SHARE_CAP))
+            results[cell]["tobit"] = tobit_res
+        except Exception:
+            pass
+ 
+    return results
+ 
+ 
+# ───────────────────────────────────────────────────────────────
+#  5.  MONTE CARLO LOOP
+# ───────────────────────────────────────────────────────────────
+ 
+# Storage: for each cell × method × coefficient, keep a list of
+# (estimate, std_error, p_value) across all replications.
+store = {
+    cell: {
+        method: {col: {"coef": [], "se": [], "pval": []}
+                 for col in REG_COLS}
+        for method in ("ols", "tobit")
+    }
+    for cell in CELLS
+}
+ 
+print(f"Running {N_MC} Monte Carlo replications (N={N} each)…")
+ 
+for mc in tqdm(range(N_MC)):
+    df      = simulate(seed=mc)
+    mc_res  = run_regressions(df)
+ 
+    for cell in CELLS:
+        for method in ("ols", "tobit"):
+            res = mc_res[cell][method]
+            if res is None:
+                continue
+            for i, col in enumerate(REG_COLS):
+                store[cell][method][col]["coef"].append(res.params[i])
+                store[cell][method][col]["se"  ].append(res.bse[i])
+                store[cell][method][col]["pval"].append(res.pvalues[i])
+ 
+print("Done.\n")
+ 
+ 
+# ───────────────────────────────────────────────────────────────
+#  6.  AGGREGATE & DISPLAY
+#  For each cell × method × regressor:
+#    mean_coef   — average point estimate across runs
+#    mean_se     — average standard error across runs
+#    sd_coef     — std dev of point estimates (MC uncertainty)
+#    rej_rate    — share of runs where p < 0.05 (empirical power)
+# ───────────────────────────────────────────────────────────────
+ 
+def aggregate(vals: list) -> dict:
+    a = np.array(vals)
+    return {"mean": np.mean(a), "sd": np.std(a), "n": len(a)}
+ 
+rows = []
+for cell in CELLS:
+    for method in ("ols", "tobit"):
+        for col in REG_COLS:
+            d = store[cell][method][col]
+            if len(d["coef"]) == 0:
+                continue
+            coef_arr = np.array(d["coef"])
+            se_arr   = np.array(d["se"])
+            pval_arr = np.array(d["pval"])
+            rows.append({
+                "cell"       : cell,
+                "method"     : method.upper(),
+                "regressor"  : col,
+                "mean_coef"  : np.mean(coef_arr),
+                "sd_coef"    : np.std(coef_arr),
+                "mean_se"    : np.mean(se_arr),
+                "rej_rate_5" : np.mean(pval_arr < 0.05),
+                "n_runs"     : len(coef_arr),
+            })
+ 
+summary = pd.DataFrame(rows)
+ 
+# ── Console output — one table per cell ─────────────────────────
+for cell in CELLS:
+    print(f"{'─'*70}")
+    print(f"  Cell: {cell}   active JS facet: {JS_COL[cell]}")
+    print(f"{'─'*70}")
+    sub = summary[summary["cell"] == cell][
+        ["method", "regressor", "mean_coef", "sd_coef", "mean_se", "rej_rate_5"]
+    ].copy()
+    sub.columns = ["Method", "Regressor", "Mean coef", "SD(coef)", "Mean SE", "Rej. rate (5%)"]
+    print(sub.to_string(index=False, float_format=lambda x: f"{x:8.4f}"))
+    print()
+ 
+ 
+# ── Save to Excel ────────────────────────────────────────────────
+out_file = "monte_carlo_results.xlsx"
+ 
+with pd.ExcelWriter(out_file, engine="openpyxl") as writer:
+ 
+    # Sheet 1: full summary (all cells, both methods)
+    summary.to_excel(writer, sheet_name="Full summary", index=False)
+ 
+    # Sheets 2-5: one sheet per cell, formatted like Table 4
+    for cell in CELLS:
+        sub = summary[summary["cell"] == cell].copy()
+ 
+        # pivot so OLS and Tobit sit side by side
+        pivot = sub.pivot_table(
+            index="regressor",
+            columns="method",
+            values=["mean_coef", "sd_coef", "mean_se", "rej_rate_5"],
+            aggfunc="first",
+        )
+        pivot = pivot.reindex(REG_COLS)           # restore regressor order
+        pivot.to_excel(writer, sheet_name=f"Cell {cell}")
+ 
+print(f"\nResults saved to {out_file}")
+ 
